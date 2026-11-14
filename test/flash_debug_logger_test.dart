@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flash_debug/flash_debug.dart';
@@ -55,14 +56,13 @@ void main() {
     await logger.close();
   });
 
-  test('retries a retryable response with the same event id', () async {
+  test('retries a retryable response with the same body and event id',
+      () async {
     var attempts = 0;
-    final ids = <String>[];
+    final bodies = <String>[];
     final client = MockClient((request) async {
       attempts += 1;
-      final body = jsonDecode(request.body) as Map<String, dynamic>;
-      final items = body['items'] as List<dynamic>;
-      ids.add(items.single['id'] as String);
+      bodies.add(request.body);
       return attempts == 1
           ? Response('temporary failure', 503)
           : Response('{}', 200);
@@ -73,6 +73,7 @@ void main() {
         clientId: 'flutter-test',
         maxRetries: 1,
         retryBaseDelay: Duration.zero,
+        retryJitterRatio: 0,
         httpClient: client,
       ),
     );
@@ -81,11 +82,16 @@ void main() {
     await logger.flush();
 
     expect(attempts, 2);
-    expect(ids.first, ids.last);
+    expect(bodies.first, bodies.last);
+    final firstItems =
+        (jsonDecode(bodies.first) as Map<String, dynamic>)['items'] as List;
+    final lastItems =
+        (jsonDecode(bodies.last) as Map<String, dynamic>)['items'] as List;
+    expect(firstItems.single['id'], lastItems.single['id']);
     await logger.close();
   });
 
-  test('does not retry a permanent response', () async {
+  test('drops a permanent failure batch so close does not retry it', () async {
     var attempts = 0;
     final client = MockClient((_) async {
       attempts += 1;
@@ -97,6 +103,7 @@ void main() {
         clientId: 'flutter-test',
         maxRetries: 3,
         retryBaseDelay: Duration.zero,
+        retryJitterRatio: 0,
         httpClient: client,
       ),
     );
@@ -105,6 +112,200 @@ void main() {
     await expectLater(logger.flush(), throwsA(isA<FlashDebugHttpException>()));
 
     expect(attempts, 1);
-    await expectLater(logger.close(), throwsA(isA<FlashDebugHttpException>()));
+    expect(logger.queuedCount, 0);
+    expect(logger.droppedCount, 1);
+    await logger.close();
+    expect(attempts, 1);
+  });
+
+  test('snapshots nested attributes before enqueueing', () async {
+    late Request request;
+    final client = MockClient((incoming) async {
+      request = incoming;
+      return Response('{}', 200);
+    });
+    final attributes = <String, Object?>{
+      'nested': <String, Object?>{'value': 'before'},
+    };
+    final logger = FlashDebugLogger(
+      FlashDebugOptions(
+        baseUrl: 'https://debug.example.com',
+        clientId: 'flutter-test',
+        flushInterval: Duration(hours: 1),
+        httpClient: client,
+      ),
+    );
+
+    logger.info('snapshot', attributes: attributes);
+    (attributes['nested'] as Map<String, Object?>)['value'] = 'after';
+    await logger.flush();
+
+    final body = jsonDecode(request.body) as Map<String, dynamic>;
+    final items = body['items'] as List<dynamic>;
+    final item = items.single as Map<String, dynamic>;
+    final nested = item['attributes'] as Map<String, dynamic>;
+    expect((nested['nested'] as Map<String, dynamic>)['value'], 'before');
+    await logger.close();
+  });
+
+  test('reports and drops unsupported attribute values', () async {
+    final errors = <Object>[];
+    final client = MockClient((_) async => Response('{}', 200));
+    final logger = FlashDebugLogger(
+      FlashDebugOptions(
+        baseUrl: 'https://debug.example.com',
+        clientId: 'flutter-test',
+        flushInterval: Duration(hours: 1),
+        httpClient: client,
+        onError: (error, _) => errors.add(error),
+      ),
+    );
+
+    logger.info('invalid', attributes: <String, Object?>{'value': Object()});
+
+    expect(logger.queuedCount, 0);
+    expect(logger.droppedCount, 1);
+    expect(errors.single, isA<FlashDebugSerializationException>());
+    await logger.close();
+  });
+
+  test('drops redaction failures by default', () async {
+    final errors = <Object>[];
+    final logger = FlashDebugLogger(
+      FlashDebugOptions(
+        baseUrl: 'https://debug.example.com',
+        clientId: 'flutter-test',
+        flushInterval: Duration(hours: 1),
+        httpClient: MockClient((_) async => Response('{}', 200)),
+        redact: (_) => throw StateError('redactor failed'),
+        onError: (error, _) => errors.add(error),
+      ),
+    );
+
+    logger.info('redacted');
+
+    expect(logger.queuedCount, 0);
+    expect(logger.droppedCount, 1);
+    expect(errors.single, isA<StateError>());
+    await logger.close();
+  });
+
+  test('can propagate redaction failures in strict mode', () async {
+    final logger = FlashDebugLogger(
+      FlashDebugOptions(
+        baseUrl: 'https://debug.example.com',
+        clientId: 'flutter-test',
+        flushInterval: Duration(hours: 1),
+        httpClient: MockClient((_) async => Response('{}', 200)),
+        redactionFailurePolicy: RedactionFailurePolicy.throwError,
+        redact: (_) => throw StateError('redactor failed'),
+      ),
+    );
+
+    expect(() => logger.info('redacted'), throwsStateError);
+    expect(logger.droppedCount, 0);
+    await logger.close();
+  });
+
+  test('drops events over the configured event size limit', () async {
+    final errors = <Object>[];
+    final logger = FlashDebugLogger(
+      FlashDebugOptions(
+        baseUrl: 'https://debug.example.com',
+        clientId: 'flutter-test',
+        maxEventBytes: 256,
+        maxBatchBytes: 512,
+        flushInterval: Duration(hours: 1),
+        httpClient: MockClient((_) async => Response('{}', 200)),
+        onError: (error, _) => errors.add(error),
+      ),
+    );
+
+    logger.info('large', content: 'x' * 1000);
+
+    expect(logger.queuedCount, 0);
+    expect(logger.droppedCount, 1);
+    expect(errors.single, isA<FlashDebugPayloadTooLargeException>());
+    await logger.close();
+  });
+
+  test('splits batches that exceed the configured byte limit', () async {
+    final requests = <Request>[];
+    final client = MockClient((request) async {
+      requests.add(request);
+      return Response('{}', 200);
+    });
+    final logger = FlashDebugLogger(
+      FlashDebugOptions(
+        baseUrl: 'https://debug.example.com',
+        clientId: 'flutter-test',
+        batchSize: 2,
+        maxEventBytes: 400,
+        maxBatchBytes: 400,
+        flushInterval: Duration(hours: 1),
+        httpClient: client,
+      ),
+    );
+
+    logger.info('first');
+    logger.info('second');
+    await logger.flush();
+
+    expect(requests, hasLength(2));
+    for (final request in requests) {
+      final body = jsonDecode(request.body) as Map<String, dynamic>;
+      expect(body['items'], hasLength(1));
+    }
+    await logger.close();
+  });
+
+  test('applies queue overflow policy and reports dropped records', () async {
+    final dropped = <String>[];
+    final logger = FlashDebugLogger(
+      FlashDebugOptions(
+        baseUrl: 'https://debug.example.com',
+        clientId: 'flutter-test',
+        queueLimit: 2,
+        batchSize: 10,
+        flushInterval: Duration(hours: 1),
+        httpClient: MockClient((_) async => Response('{}', 200)),
+        onDrop: (record) => dropped.add(record.message),
+      ),
+    );
+
+    logger.info('first');
+    logger.info('second');
+    logger.info('third');
+
+    expect(logger.queuedCount, 2);
+    expect(logger.droppedCount, 1);
+    expect(dropped, ['first']);
+    await logger.close();
+  });
+
+  test('bounds close when the upload does not complete', () async {
+    final errors = <Object>[];
+    final client = MockClient((_) async {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      return Response('{}', 200);
+    });
+    final logger = FlashDebugLogger(
+      FlashDebugOptions(
+        baseUrl: 'https://debug.example.com',
+        clientId: 'flutter-test',
+        closeTimeout: const Duration(milliseconds: 10),
+        timeout: const Duration(seconds: 1),
+        maxRetries: 0,
+        flushInterval: Duration(hours: 1),
+        httpClient: client,
+        onError: (error, _) => errors.add(error),
+      ),
+    );
+
+    logger.info('slow');
+    await logger.close();
+
+    expect(errors.single, isA<TimeoutException>());
+    await Future<void>.delayed(const Duration(milliseconds: 120));
   });
 }

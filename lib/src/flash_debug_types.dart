@@ -8,6 +8,13 @@ enum QueueOverflowPolicy {
   throwError,
 }
 
+enum RedactionFailurePolicy {
+  drop,
+  throwError,
+}
+
+const String flashDebugSdkVersion = '0.1.0';
+
 class DebugLogRecord {
   const DebugLogRecord({
     required this.id,
@@ -81,19 +88,30 @@ class FlashDebugOptions {
     this.timeout = const Duration(seconds: 10),
     this.maxRetries = 3,
     this.retryBaseDelay = const Duration(milliseconds: 250),
+    this.retryMaxDelay = const Duration(seconds: 30),
+    this.retryJitterRatio = 0.2,
+    this.maxEventBytes = 256 * 1024,
+    this.maxBatchBytes = 1024 * 1024,
+    this.closeTimeout = const Duration(seconds: 5),
     this.overflowPolicy = QueueOverflowPolicy.dropOldest,
+    this.redactionFailurePolicy = RedactionFailurePolicy.drop,
     this.onError,
     this.onDrop,
     this.redact,
     this.httpClient,
     this.sdkName = 'flash-debug-flutter',
-    this.sdkVersion = '0.1.0',
+    this.sdkVersion = flashDebugSdkVersion,
   })  : assert(batchSize > 0),
         assert(flushInterval >= Duration.zero),
         assert(queueLimit > 0),
         assert(timeout > Duration.zero),
         assert(maxRetries >= 0),
-        assert(retryBaseDelay >= Duration.zero);
+        assert(retryBaseDelay >= Duration.zero),
+        assert(retryMaxDelay >= Duration.zero),
+        assert(retryJitterRatio >= 0 && retryJitterRatio <= 1),
+        assert(maxEventBytes > 0),
+        assert(maxBatchBytes >= maxEventBytes),
+        assert(closeTimeout > Duration.zero);
 
   final String baseUrl;
   final String clientId;
@@ -107,7 +125,13 @@ class FlashDebugOptions {
   final Duration timeout;
   final int maxRetries;
   final Duration retryBaseDelay;
+  final Duration retryMaxDelay;
+  final double retryJitterRatio;
+  final int maxEventBytes;
+  final int maxBatchBytes;
+  final Duration closeTimeout;
   final QueueOverflowPolicy overflowPolicy;
+  final RedactionFailurePolicy redactionFailurePolicy;
   final void Function(Object error, StackTrace stackTrace)? onError;
   final void Function(DebugLogRecord record)? onDrop;
   final DebugLogRecord Function(DebugLogRecord record)? redact;
@@ -125,6 +149,29 @@ class FlashDebugException implements Exception {
   String toString() => 'FlashDebugException: $message';
 }
 
+class FlashDebugSerializationException extends FlashDebugException {
+  const FlashDebugSerializationException(super.message);
+
+  @override
+  String toString() => 'FlashDebugSerializationException: $message';
+}
+
+class FlashDebugPayloadTooLargeException extends FlashDebugException {
+  const FlashDebugPayloadTooLargeException({
+    required this.payload,
+    required this.actualBytes,
+    required this.maxBytes,
+  }) : super(
+            '$payload is $actualBytes bytes and exceeds the $maxBytes byte limit');
+
+  final String payload;
+  final int actualBytes;
+  final int maxBytes;
+
+  @override
+  String toString() => 'FlashDebugPayloadTooLargeException: $message';
+}
+
 class FlashDebugHttpException extends FlashDebugException {
   const FlashDebugHttpException({
     required this.statusCode,
@@ -136,7 +183,9 @@ class FlashDebugHttpException extends FlashDebugException {
   final String? body;
 
   bool get isRetryable =>
-      statusCode == 408 || statusCode == 429 || statusCode >= 500;
+      statusCode == 408 ||
+      statusCode == 429 ||
+      (statusCode >= 500 && statusCode < 600);
 
   @override
   String toString() => 'FlashDebugHttpException($statusCode): $message';
