@@ -1,0 +1,21 @@
+name: flash_debug
+description: A Flutter and Dart logger SDK for reporting complete events to Flash Debug.
+version: 0.1.0
+homepage: https://github.com/flash-debug-js/flash-debug-flutter-sdk
+repository: https://github.com/flash-debug-js/flash-debug-flutter-sdk
+issue_tracker: https://github.com/flash-debug-js/flash-debug-flutter-sdk/issues
+topics:
+  - logging
+  - debugging
+  - flutter
+  - observability
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+
+dependencies:
+  http: ^1.2.2
+
+dev_dependencies:
+  lints: ^5.1.1
+  test: ^1.25.8
