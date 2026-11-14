@@ -118,6 +118,58 @@ void main() {
     expect(attempts, 1);
   });
 
+  test('does not retry authorization failures', () async {
+    for (final statusCode in [401, 403]) {
+      var attempts = 0;
+      final logger = FlashDebugLogger(
+        FlashDebugOptions(
+          baseUrl: 'https://debug.example.com',
+          clientId: 'flutter-test',
+          retryBaseDelay: Duration.zero,
+          retryJitterRatio: 0,
+          httpClient: MockClient((_) async {
+            attempts += 1;
+            return Response('unauthorized', statusCode);
+          }),
+        ),
+      );
+
+      logger.info('authorization failure');
+      await expectLater(
+          logger.flush(), throwsA(isA<FlashDebugHttpException>()));
+
+      expect(attempts, 1);
+      expect(logger.queuedCount, 0);
+      await logger.close();
+    }
+  });
+
+  test('honors a retry-after header before retrying', () async {
+    var attempts = 0;
+    final client = MockClient((_) async {
+      attempts += 1;
+      return attempts == 1
+          ? Response('temporary failure', 429, headers: {'retry-after': '0'})
+          : Response('{}', 200);
+    });
+    final logger = FlashDebugLogger(
+      FlashDebugOptions(
+        baseUrl: 'https://debug.example.com',
+        clientId: 'flutter-test',
+        maxRetries: 1,
+        retryBaseDelay: const Duration(seconds: 1),
+        retryJitterRatio: 0,
+        httpClient: client,
+      ),
+    );
+
+    logger.info('retry-after');
+    await logger.flush();
+
+    expect(attempts, 2);
+    await logger.close();
+  });
+
   test('snapshots nested attributes before enqueueing', () async {
     late Request request;
     final client = MockClient((incoming) async {
